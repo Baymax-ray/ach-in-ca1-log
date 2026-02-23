@@ -1,0 +1,1262 @@
+---
+title: "Ach_Speed"
+author: "Jiarui Fang"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+Sys.setenv(LANGUAGE = "en")
+```
+
+```{r}
+#library
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(MuMIn)
+library(performance)
+library(readr)
+library(dplyr)
+library(ggeffects)
+library(partR2)
+library(slider)
+library(tibble)
+library(emmeans)
+library(scales)
+```
+
+```{r load data}
+# Vector of animal IDs (as character)
+animal_ids <- c("GACH16", "GACH19", "GACH33", "GACH39", "GACH40")
+
+# Base data directory
+data_dir    <- "../data-raw"
+
+# Empty list to collect all data.frames
+data_list   <- list()
+
+for (animal in animal_ids) {
+  # build path to this animal’s top‐level folder
+  animal_path <- file.path(data_dir, animal)
+  
+  # find all “*clean_data.csv” files anywhere under that folder
+  csv_files   <- list.files(
+    path        = animal_path,
+    pattern     = "clean_data\\.csv$",
+    recursive   = TRUE,
+    full.names  = TRUE
+  )
+  
+  # read each file and store in data_list
+  for (file in csv_files) {
+    df_name <- paste(animal, gsub(".*/", "", file), sep = "_")
+    df_name # inspect the name of the data frame
+    suppressMessages(df <- read_csv(file, show_col_types = FALSE))
+    # remove any columns that has no header
+    df <- df %>% select(-starts_with("..."))
+    data_list[[df_name]] <- df
+  }
+}
+
+```
+
+```{r reformat data}
+# Combine all data frames into one
+all_data <- bind_rows(data_list)
+# refomat the data
+all_data <- all_data %>% 
+  mutate(lightness = str_extract(session, "(?<=_)[^_]+$"))
+all_data <- all_data %>% 
+  mutate(session = paste(animal,lightness, date, sep = "_"))
+all_data$session <- factor(all_data$session)
+#remove rows containing NA in velocity or dFF_z
+all_data <- all_data %>% drop_na(velocity, dFF_z)
+all_data$lightness <- factor(all_data$lightness)
+all_data$animal <- factor(all_data$animal)
+rm(data_list, df)
+all_data$lightness <- relevel(all_data$lightness, ref = "light")
+all_data<- all_data %>% rename(speed = velocity) #it is actually velocity, wrong name in the original data
+# create session_short variable for easier plotting
+session_map <- all_data %>%
+  distinct(animal, date, lightness, session) %>%  # unique session rows
+  arrange(animal, date) %>%
+  group_by(animal) %>%
+  mutate(day_idx = dense_rank(date)) %>%          # same index for same date
+  ungroup() %>%
+  mutate(
+    LD = if_else(lightness == "light", "L", "D"),
+    session_facet = paste0(animal, "_", LD, "_", day_idx)
+  )
+
+all_data <- all_data %>%
+  left_join(session_map %>% select(session, session_facet), by = "session")
+
+all_data$session_facet <- factor(all_data$session_facet)
+```
+
+```{r binned data}
+bin_width <- 0.2  # seconds; should match the GRAB ACh feature
+
+binned_data <- all_data %>%
+  arrange(animal, session, time) %>%
+  mutate(
+    bin = cut(
+      time,
+      breaks = seq(0, max(time, na.rm = TRUE) + bin_width, by = bin_width),
+      right = FALSE,
+      labels = FALSE
+    ) - 1L
+  ) %>%
+  group_by(animal, session, lightness, bin) %>%
+  summarise(
+    # REMOVED time_bin calculation here
+    dFF_z    = mean(dFF_z, na.rm = TRUE),
+    speed = mean(speed, na.rm = TRUE),
+    x        = mean(x, na.rm = TRUE),
+    y        = mean(y, na.rm = TRUE),
+    n_in_bin     = n(),
+    session_facet = first(session_facet),
+    .groups = "drop"
+  ) %>%
+  # ADD time_bin calculation here (it runs on the summarized rows)
+  mutate(
+    time_bin = (bin + 0.5) * bin_width
+  ) %>%
+  filter(n_in_bin >= 1)
+# calculate change of speed (acceleration)
+binned_data <- binned_data %>%
+  group_by(session) %>%
+  arrange(time_bin, .by_group = TRUE) %>%
+  mutate(
+    # central difference (better than forward difference)
+    changeOfSpeed = (lead(speed) - lag(speed)) / (lead(time_bin) - lag(time_bin))
+  ) %>%
+  ungroup()
+binned_data$log_speed <- log(binned_data$speed) # add log speed column
+sum(!is.finite(binned_data$log_speed)) # check for log(0)=-Inf
+#make session_facet ordered by LD, animal_id, idx
+binned_data <- binned_data %>%
+  mutate(
+    LD = str_match(session_facet, "_([LD])_")[,2],                 # "L" or "D"
+    animal_id = str_extract(session_facet, "^[^_]+"),              # "GACH16"
+    idx = as.integer(str_match(session_facet, "_[LD]_(\\d+)$")[,2])# 1,2,3,...
+  ) %>%
+  arrange(LD, animal_id, idx) %>%
+  mutate(session_facet = factor(session_facet, levels = unique(session_facet)))
+```
+
+```{r slow speed}
+v_threshold <- 3   # slower than 3 cm/s
+min_duration_s = 5
+
+# binned_data has: session, time, speed (plus x, y, etc.)
+bouts <- binned_data %>%
+  arrange(session, time_bin) %>%
+  group_by(session) %>%
+  mutate(
+    slow = speed < 3,
+    bout_id = cumsum(slow != lag(slow, default = first(slow)))
+  ) %>%
+  group_by(session, bout_id) %>%
+  summarise(
+    slow = first(slow),
+    t_start = first(time_bin),
+    t_end   = last(time_bin),
+    duration_s = as.numeric(t_end - t_start),
+    .groups = "drop"
+  ) %>%
+  filter(slow, duration_s >= min_duration_s)
+
+# Get all original rows that fall inside qualifying bouts
+df_slow <- binned_data %>%
+  arrange(session, time_bin) %>%
+  group_by(session) %>%
+  # Re-calculate bout_id on the full dataset
+  mutate(
+    slow = speed < 3,
+    bout_id = cumsum(slow != lag(slow, default = first(slow)))
+  ) %>%
+  ungroup() %>%
+  # ONLY keep rows where the (session, bout_id) pair exists in our filtered 'bouts' list
+  semi_join(bouts, by = c("session", "bout_id"))
+
+```
+```{r immobility check}
+max_distance_diameter <- 5  # cm
+
+sampling_rate <- 1 / bin_width
+window_size <- round(min_duration_s * sampling_rate)
+
+df_immobile <- df_slow %>%
+  arrange(session, time_bin) %>%
+  group_by(session) %>%
+  mutate(
+    # 1) trailing window 内是否全部低速
+    is_slow_window = slider::slide_lgl(
+      speed, ~ all(.x < 3, na.rm = TRUE),
+      .before = window_size - 1, .complete = TRUE
+    ),
+
+    # 2) trailing window 内的空间扩散是否 <= 5 cm（最大两点距离）
+    is_small_area = slider::slide2_lgl(
+      x, y,
+      ~ {
+        coords <- cbind(.x, .y)
+        coords <- coords[stats::complete.cases(coords), , drop = FALSE]
+        if (nrow(coords) < 2) return(FALSE)  # 没有足够点，不认为“immobile”
+        max(stats::dist(coords)) <= max_distance_diameter
+      },
+      .before = window_size - 1, .complete = TRUE
+    ),
+
+    # 窗口末端点是否满足“低速+小范围”
+    valid_end = is_slow_window & is_small_area
+  ) %>%
+  # 把“窗口末端点”为 TRUE 的窗口整体纳入（向前回看 window_size 个点）
+  mutate(
+    keep_row = slider::slide_lgl(
+      valid_end, ~ any(.x),
+      .before = window_size - 1, .complete = FALSE
+    )
+  ) %>%
+  filter(keep_row) %>%
+  select(-is_slow_window, -is_small_area, -valid_end, -keep_row)
+```
+```{r}
+# 1. Create a variable for the folder path
+output_folder <- "C:/Users/FangJ/OneDrive/研究 research/Research_Michael_Hasselmo/Ach/Paper/Figures"
+
+# 2. Create the folder if it doesn't exist
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder)
+}
+```
+## 1. Visualization
+```{r vis}
+# Scatter plot of Velocity vs. dFF_z
+set.seed(123)  # for reproducibility
+p1 <- ggplot(
+  binned_data %>% dplyr::sample_frac(0.05),
+  aes(x = speed, y = dFF_z, color = lightness)
+) +
+  geom_point(size = 0.4, alpha = 0.6) +
+  labs(
+    x = "Speed (cm/s)",
+    y = expression(Fluorescence  ~ (z-score))
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "speed_vs_dFF.tiff"), # Use .tiff or .pdf
+  plot = p1,
+  device = "tiff",        # Change to "pdf" if needed
+  width = 180,            # Common width for 2-column journal images
+  height = 120,           # Adjust height accordingly
+  units = "mm",           # Use "mm" or "in"
+  dpi = 300,              # Minimum requirement for most journals
+  compression = "lzw",     # Reduces TIFF file size without losing quality
+  bg = "white"            # Set background to white for better visibility
+)
+# Scatter plot of Speed vs. dFF_z faceted by sessions
+p_speed_facet <- ggplot(binned_data, aes(x = speed, y = dFF_z, color = lightness)) +
+  geom_point(size=0.5, alpha = 0.6) +
+  facet_wrap(~ session_facet) +
+  labs(x = "Speed (cm/s)", y = expression(Fluorescence  ~ (z-score))) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "speed_vs_dFF_faceted.tiff"),
+  plot = p_speed_facet,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Scatter plot of Speed vs. dFF_z faceted by animals
+p_speed_facet_animal <- ggplot(binned_data, aes(x = speed, y = dFF_z, color = lightness)) +
+  geom_point(size=0.2, alpha = 0.2) +
+  facet_wrap(~ animal) +
+  labs(x = "Speed (cm/s)", y = expression(Fluorescence  ~ (z-score))) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "speed_vs_dFF_faceted_by_animal.tiff"),
+  plot = p_speed_facet_animal,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+```{r vis log}
+# Scatter plot of Log(speed) vs. dFF_z
+p_logspeed <- ggplot(
+  binned_data %>% dplyr::sample_frac(0.05),
+  aes(x = log_speed, y = dFF_z, color = lightness)
+) +
+  geom_point(size = 0.4, alpha = 0.6) +
+  labs(x = "Log(speed) (cm/s)",
+    y = expression(Fluorescence  ~ (z-score))
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "log_speed_vs_dFF.tiff"),
+  plot = p_logspeed,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+# Scatter plot of Log(speed) vs. dFF_z faceted by sessions
+p_logspeed_facet <- ggplot(binned_data, aes(x = log_speed, y = dFF_z, color = lightness)) +
+  geom_point(size=0.5, alpha = 0.6) +
+  facet_wrap(~ session_facet) +
+  labs(x = "Log(speed) (cm/s)", y = expression(Fluorescence  ~ (z-score))) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(output_folder, "log_speed_vs_dFF_faceted.tiff"),
+  plot = p_logspeed_facet,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+# Scatter plot of Log(speed) vs. dFF_z faceted by animals
+p_logspeed_facet_animal <- ggplot(binned_data, aes(x = log_speed, y = dFF_z, color = lightness)) +
+  geom_point(size=0.2, alpha = 0.2) +
+  facet_wrap(~ animal) +
+  labs(x = "Log(speed) (cm/s)", y = expression(Fluorescence  ~ (z-score))) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "log_speed_vs_dFF_faceted_by_animal.tiff"),
+  plot = p_logspeed_facet_animal,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+## 2. Descriptive statistics
+```{r}
+# number of observations
+n_obs <- nrow(binned_data)
+cat("Number of observations:", n_obs, "\n")
+n_imm_obs <- nrow(df_immobile)
+cat("Number of immobility observations:", n_imm_obs, "\n")
+cat("Percentage of immobility observations:", round((n_imm_obs / n_obs) * 100, 2), "%\n")
+
+# A) lightness level
+tbl_overall_by_lightness <- binned_data %>%
+  group_by(lightness) %>%
+  summarise(
+    n_animals = n_distinct(animal),
+    n_sessions = n_distinct(session),
+    n_observations = n(),
+    median_obs_per_session = median(as.numeric(table(session))),
+    IQR_obs_per_session = IQR(as.numeric(table(session))),
+    .groups = "drop"
+  )
+
+# B) animal level
+tbl_sessions_per_animal <- binned_data %>%
+  distinct(animal, session, lightness) %>%
+  count(animal, lightness, name = "n_sessions") %>%
+  pivot_wider(names_from = lightness, values_from = n_sessions, values_fill = 0) %>%
+  mutate(
+    has_both_conditions = if_else(rowSums(across(where(is.numeric)) > 0) >= 2, TRUE, FALSE)
+  )
+
+# C) session level
+tbl_session_level <- binned_data %>%
+  group_by(animal, session, lightness) %>%
+  summarise(
+    n_observations = n(),
+    duration_s = max(time_bin, na.rm = TRUE) - min(time_bin, na.rm = TRUE),
+    mean_speed = mean(speed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tbl_overall_by_lightness
+tbl_sessions_per_animal
+summary(tbl_session_level$n_observations)
+summary(tbl_session_level$duration_s)
+
+#comparison at session level
+session_stats <- tbl_session_level %>%
+  group_by(lightness) %>%
+  summarise(
+    mean_duration = mean(duration_s, na.rm = TRUE),
+    sd_duration = sd(duration_s, na.rm = TRUE),
+    mean_speed = mean(mean_speed, na.rm = TRUE),
+    sd_speed = sd(mean_speed, na.rm = TRUE)
+  )
+# t-test for speed at session level between light and dark
+t_test_session_speed <- t.test(mean_speed ~ lightness, data = tbl_session_level)
+t_test_session_speed
+```
+```{r}
+# Heatmaps of occupancy by sessions
+p_occ_heatmap <- ggplot(binned_data, aes(x = x, y = y)) +
+  geom_bin2d(aes(fill = after_stat(count / sum(count))), bins = 60) +
+  scale_fill_viridis_c(name = "Occupancy (fraction)") +
+  facet_wrap(~ session_facet) +
+  coord_equal() +
+  theme_minimal() +
+  labs(x = "X position", y = "Y position")
+
+ggsave(
+  filename = file.path(output_folder, "occupancy_heatmap_by_session.tiff"),
+  plot = p_occ_heatmap,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+# Heatmaps of speed by sessions
+p_speed_heatmap <- ggplot(binned_data, aes(x = x, y = y, z = speed)) +
+  stat_summary_2d(
+    fun = mean,
+    bins = 60
+  ) +
+  scale_fill_viridis_c(name = "Mean speed") +
+  facet_wrap(~ session_facet) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    x = "X position",
+    y = "Y position"
+  )
+ggsave(
+  filename = file.path(output_folder, "speed_heatmap_by_session.tiff"),
+  plot = p_speed_heatmap,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Heatmaps of dFF_z by sessions
+p_dFF_z_heatmap <- ggplot(binned_data, aes(x = x, y = y, z = dFF_z)) +
+  stat_summary_2d(
+    fun = mean,
+    bins = 60
+  ) +
+  scale_fill_viridis_c(name = expression("Mean " * Fluorescence )) +
+  facet_wrap(~ session_facet) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    x = "X position",
+    y = "Y position"
+  )
+ggsave(
+  filename = file.path(output_folder, "dFF_z_heatmap_by_session.tiff"),
+  plot = p_dFF_z_heatmap,
+  device = "tiff",
+  width = 250,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Histogram of speed
+p_hist_speed <- ggplot(binned_data, aes(x = speed,y = after_stat(count/sum(count)),fill = lightness)) +
+  geom_histogram(alpha = 0.6, bins = 30, position = "identity") +
+  facet_wrap(~ lightness) +
+  labs(
+       x = "Speed (cm/s)", 
+       y = "Percentage") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "speed_distribution_by_lightness.tiff"),
+  plot = p_hist_speed,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Histogram of dFF_z
+p_hist_dFF_z <- ggplot(binned_data, aes(x = dFF_z, y = after_stat(count/sum(count)),fill = lightness)) +
+  geom_histogram(alpha = 0.6, bins = 30, position = "identity") +
+  facet_wrap(~ lightness) +
+  labs(
+  x = expression(Fluorescence  ~ (z-score)), 
+  y =  "Percentage") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "dFF_z_distribution_by_lightness.tiff"),
+  plot = p_hist_dFF_z,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+```{r}
+summary(binned_data$speed)
+summary(binned_data$dFF_z)
+t_test_speed <- t.test(speed ~ lightness, data = binned_data)
+t_test_dFF_z <- t.test(dFF_z ~ lightness, data = binned_data)
+cat("T-test for Speed:\n")
+print(t_test_speed)
+cat("T-test for dFF_z:\n")
+print(t_test_dFF_z)
+# Apply log transformation to speed
+summary(binned_data$log_speed)
+t_test_logspeed <- t.test(log_speed ~ lightness, data = binned_data)
+cat("T-test for Log(speed):\n")
+print(t_test_logspeed)
+```
+```{r}
+# summary statistics by lightness
+binned_data %>% 
+  group_by(lightness) %>% 
+  summarise(
+    mean_dFF_z = mean(dFF_z),
+    sd_dFF_z = sd(dFF_z),
+    mean_speed = mean(speed),
+    sd_speed = sd(speed),
+    n = n()
+  )
+
+# one‐way ANOVA for velocity
+res.aov_velocity <- aov(speed ~ animal, data = binned_data)
+# overall F‐test
+summary(res.aov_velocity)
+
+# one‐way ANOVA for dFF_z
+res.aov_dFF_z <- aov(dFF_z ~ animal, data = binned_data)
+summary(res.aov_dFF_z)
+
+# Statistics by animal
+animal_stats <- binned_data %>%
+  group_by(animal) %>%
+  summarise(
+    count = n(),
+    mean_speed = mean(speed, na.rm = TRUE),
+    sd_speed = sd(speed, na.rm = TRUE),
+    mean_dFF_z = mean(dFF_z, na.rm = TRUE),
+    sd_dFF_z = sd(dFF_z, na.rm = TRUE)
+  )
+print(animal_stats)
+```
+
+
+## 3. Regression based analyses
+
+```{r linear}
+# Linear mixed-effects model-Linear Relationship
+model_lin <- lmer(dFF_z ~ speed + lightness + (1 | animal/session),
+               data = binned_data, REML = FALSE)
+
+# Summary of the model
+summary(model_lin)
+
+# 95% confidence intervals for fixed effects
+confint(model_lin, parm = "beta_", method = "Wald")
+```
+
+```{r draw linear}
+pred_lin <- ggpredict(model_lin, terms = c("speed [all]", "lightness"))
+set.seed(123)
+p_linear_sample<-ggplot(pred_lin, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Speed (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = binned_data %>% dplyr::sample_frac(0.05),
+    aes(x = speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(output_folder, "linear_model_dFF_vs_speed.tiff"),
+  plot = p_linear_sample,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+
+### Log transformation of speed
+```{r log }
+# Linear mixed-effects model with log-transformed speed
+model_log <- lmer(dFF_z ~ log_speed + lightness + (1 | animal/session),
+                  data = binned_data, REML = FALSE)
+
+# Summarize the model
+summary(model_log)
+
+# 95% confidence intervals for fixed effects
+confint(model_log, parm = "beta_", method = "Wald")
+
+# LRT
+anova(model_lin, model_log)
+
+lme4::isSingular(model_log)
+```
+
+
+```{r draw log}
+pred_log <- ggpredict(model_log, terms = c("log_speed [all]", "lightness"))
+set.seed(123)
+p_log_sample <- ggplot(pred_log, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Log(speed) (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = binned_data %>% dplyr::sample_frac(0.05),
+    aes(x = log_speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "log_model_dFF_vs_log_speed.tiff"),
+  plot = p_log_sample,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+
+
+## 4. Interaction model
+```{r log only & middle random effect}
+model_log_interaction_mid <- lmer(dFF_z ~ log_speed * lightness + (1 | animal:session) + (log_speed || animal),
+           data = binned_data, REML = FALSE)
+isSingular(model_log_interaction_mid) # if any random effect is singular
+VarCorr(model_log_interaction_mid)
+anova(model_log, model_log_interaction_mid)
+model_log_interaction_mid_REML<- update(model_log_interaction_mid,
+                                             REML = TRUE)
+summary(model_log_interaction_mid_REML)
+confint(model_log_interaction_mid_REML, parm = "beta_", method = "Wald")
+
+# A) slopes for each lightness level
+slopes <- emtrends(model_log_interaction_mid_REML, ~ lightness, var = "log_speed")
+slopes
+confint(slopes)
+
+# B) pairwise comparisons of slopes
+slope_contrast <- pairs(slopes)
+slope_contrast
+confint(slope_contrast)
+
+slopes_tbl <- summary(slopes) %>% as.data.frame()
+slope_contrast_tbl <- summary(slope_contrast) %>% as.data.frame()
+slopes_tbl
+slope_contrast_tbl
+```
+Good, this is not singular, and the interaction is still significant.
+
+```{r draw log interaction mid}
+pred_log_interaction_final <- ggpredict(model_log_interaction_mid_REML, terms = c("log_speed [all]", "lightness"))
+set.seed(123)
+p_log_interaction <- ggplot(pred_log_interaction_final, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Log(speed) (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = binned_data %>% dplyr::sample_frac(0.05),
+    aes(x = log_speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "log_interaction_model_dFF_vs_log_speed.tiff"),
+  plot = p_log_interaction,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+pred_raw <- as.data.frame(pred_log_interaction_final) %>%
+  mutate(
+    x = as.numeric(x),
+    speed = exp(x)
+  )
+
+# use the raw speed for x-axis but plot the log-based model predictions
+set.seed(123)
+p_log_interaction_rawx <- ggplot(pred_raw, aes(x = speed, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  geom_point(
+    data = binned_data %>% dplyr::sample_frac(0.05),
+    aes(x = speed, y = dFF_z, color = lightness),
+    size = 0.2, alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    x = "Speed (cm/s)",
+    y = expression(Fluorescence~(z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "log_interaction_model_dFF_vs_speed_rawx.tiff"),
+  plot = p_log_interaction_rawx,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+```
+```{r linear only & middle random effect}
+model_lin_interaction_mid <- lmer(dFF_z ~ speed * lightness + (1 | animal:session) + (speed || animal),
+           data = binned_data, REML = FALSE)
+isSingular(model_lin_interaction_mid) # if any random effect is singular
+VarCorr(model_lin_interaction_mid)
+anova(model_lin, model_lin_interaction_mid)
+model_lin_interaction_mid_REML<- update(model_lin_interaction_mid,
+                                             REML = TRUE)
+summary(model_lin_interaction_mid_REML)
+confint(model_lin_interaction_mid_REML, parm = "beta_", method = "Wald")
+```
+```{r draw linear interaction mid}
+pred_lin_interaction_final <- ggpredict(model_lin_interaction_mid_REML, terms = c("speed [all]", "lightness"))
+set.seed(123)
+p_lin_interaction <- ggplot(pred_lin_interaction_final, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Speed (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = binned_data %>% dplyr::sample_frac(0.05),
+    aes(x = speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "linear_interaction_model_dFF_vs_speed.tiff"),
+  plot = p_lin_interaction,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+```{r  LOSO for log vs linear}
+dat_cv <- binned_data %>%
+  mutate(
+    lightness    = droplevels(lightness),
+    animal       = droplevels(animal),
+    session      = droplevels(session)
+  ) %>%
+  filter(
+    !is.na(dFF_z),
+    !is.na(lightness),
+    !is.na(animal),
+    !is.na(session)
+  )
+
+sessions <- levels(dat_cv$session)
+
+score_fold <- function(model, test_df, y = "dFF_z", pred_fixed_only = TRUE) {
+  # pred_fixed_only=TRUE：only use fixed effects for prediction
+  # pred_fixed_only=FALSE：use conditional prediction (including random effects of animal; new levels of animal:session will be set to 0)
+  pred <- predict(
+    model,
+    newdata = test_df,
+    re.form = if (pred_fixed_only) NA else NULL,
+    allow.new.levels = TRUE
+  )
+  err  <- test_df[[y]] - pred
+  rmse <- sqrt(mean(err^2, na.rm = TRUE))
+  mae  <- mean(abs(err), na.rm = TRUE)
+
+  # Gaussian log score (the bigger the better)
+  sig <- sigma(model)
+  logscore <- mean(dnorm(test_df[[y]], mean = pred, sd = sig, log = TRUE), na.rm = TRUE)
+
+  list(rmse = rmse, mae = mae, logscore = logscore)
+}
+
+# 1) LOSO：leave-one-session-out cross-validation
+results_loso <- lapply(sessions, function(s_out) {
+  train_df <- dat_cv %>% filter(session != s_out)
+  test_df  <- dat_cv %>% filter(session == s_out)
+
+  # because we want to compare linear vs. log models fixed effects, let REML=FALSE
+  m_lin <- lmer(
+    dFF_z ~ speed * lightness + (1 | animal:session) + (speed || animal),
+    data = train_df, REML = FALSE
+  )
+
+  m_log <- lmer(
+    dFF_z ~ log_speed * lightness + (1 | animal:session) + (log_speed || animal),
+    data = train_df, REML = FALSE
+  )
+
+  sc_lin <- score_fold(m_lin, test_df, pred_fixed_only = TRUE)
+  sc_log <- score_fold(m_log, test_df, pred_fixed_only = TRUE)
+
+  tibble(
+    session = s_out,
+    n_test  = nrow(test_df),
+
+    rmse_lin = sc_lin$rmse,
+    rmse_log = sc_log$rmse,
+    d_rmse   = sc_log$rmse - sc_lin$rmse,     # <0 favors log
+
+    mae_lin  = sc_lin$mae,
+    mae_log  = sc_log$mae,
+    d_mae    = sc_log$mae - sc_lin$mae,       # <0 favors log
+
+    lscore_lin = sc_lin$logscore,
+    lscore_log = sc_log$logscore,
+    d_lscore   = sc_log$logscore - sc_lin$logscore  # >0 favors log
+  )
+}) %>% bind_rows()
+
+# 2) summary of LOSO results
+summary_loso <- results_loso %>%
+  summarise(
+    n_sessions = n(),
+    mean_d_rmse = mean(d_rmse),
+    sd_d_rmse   = sd(d_rmse),
+    mean_d_mae  = mean(d_mae),
+    sd_d_mae    = sd(d_mae),
+    mean_d_lscore = mean(d_lscore),
+    sd_d_lscore   = sd(d_lscore)
+  )
+
+print(summary_loso)
+
+# 3) t.test is actually wrong, but for reference
+# d_rmse < 0 --> log and d_lscore > 0 --> log
+t_rmse   <- t.test(results_loso$d_rmse, mu = 0)
+t_mae    <- t.test(results_loso$d_mae,  mu = 0)
+t_lscore <- t.test(results_loso$d_lscore, mu = 0)
+
+t_rmse
+t_mae
+t_lscore
+
+# 4) bootstrap 95% CI for mean differences
+set.seed(1)
+B <- 5000
+boot_mean_drmse <- replicate(B, mean(sample(results_loso$d_rmse, replace = TRUE)))
+boot_ci_drmse <- quantile(boot_mean_drmse, c(0.025, 0.975))
+
+boot_mean_dlscore <- replicate(B, mean(sample(results_loso$d_lscore, replace = TRUE)))
+boot_ci_dlscore <- quantile(boot_mean_dlscore, c(0.025, 0.975))
+
+boot_ci_drmse
+boot_ci_dlscore
+```
+```{r effect size}
+# effect size
+r.squaredGLMM(model_lin)
+r.squaredGLMM(model_log)
+r.squaredGLMM(model_lin_interaction_mid_REML)
+r.squaredGLMM(model_log_interaction_mid_REML)
+AIC(model_lin, model_log)
+AIC(model_lin_interaction_mid, model_log_interaction_mid)
+```
+
+```{r check change of speed}
+binned_data_clear <- binned_data %>%
+  drop_na(changeOfSpeed)
+model_log_only <- lmer(dFF_z ~ log_speed + lightness + (1 | animal:session) + (log_speed || animal),
+           data = binned_data_clear, REML = FALSE, na.action = na.omit)
+model_ChangeOfSpeedAndLog <- lmer(dFF_z ~ log_speed * lightness + changeOfSpeed * lightness + (1 | animal:session) + (log_speed || animal) + (changeOfSpeed || animal),
+           data = binned_data_clear, REML = FALSE, na.action = na.omit)
+summary(model_ChangeOfSpeedAndLog)
+confint(model_ChangeOfSpeedAndLog, parm = "beta_", method = "Wald")
+anova(model_log_only, model_ChangeOfSpeedAndLog)
+
+model_absChangeOfSpeedAndLog <- lmer(dFF_z ~ log_speed * lightness + abs(changeOfSpeed) * lightness + (1 | animal:session) + (log_speed || animal) + (abs(changeOfSpeed) || animal),
+           data = binned_data_clear, REML = FALSE, na.action = na.omit)
+summary(model_absChangeOfSpeedAndLog)
+confint(model_absChangeOfSpeedAndLog, parm = "beta_", method = "Wald")
+anova(model_log_only, model_absChangeOfSpeedAndLog)
+check_collinearity(model_ChangeOfSpeedAndLog)
+check_collinearity(model_absChangeOfSpeedAndLog)
+```
+```{r effect size2}
+# effect size
+model_ChangeOfSpeedAndLog_REML <- update(model_ChangeOfSpeedAndLog, REML = TRUE)
+r.squaredGLMM(model_ChangeOfSpeedAndLog_REML)
+model_absChangeOfSpeedAndLog_REML <- update(model_absChangeOfSpeedAndLog, REML = TRUE)
+r.squaredGLMM(model_absChangeOfSpeedAndLog_REML)
+model_log_only_REML <- update(model_log_only, REML = TRUE)
+r.squaredGLMM(model_log_only_REML)
+AIC(model_log_only, model_ChangeOfSpeedAndLog, model_absChangeOfSpeedAndLog)
+```
+
+
+## 5. regression with immobility
+```{r immobility model}
+imm_linear_interaction_mid <- lmer(dFF_z ~ speed * lightness + (1 | animal:session) + (speed || animal),
+               data = df_immobile, REML = FALSE)
+imm_log_interaction_mid <- lmer(dFF_z ~ log_speed * lightness + (1 | animal:session) + (log_speed || animal),
+               data = df_immobile, REML = FALSE)
+```
+```{r}
+summary(imm_linear_interaction_mid)
+summary(imm_log_interaction_mid)
+anova(imm_linear_interaction_mid, imm_log_interaction_mid)
+isSingular(imm_log_interaction_mid)
+confint(imm_log_interaction_mid, parm = "beta_", method = "Wald")
+confint(imm_linear_interaction_mid, parm = "beta_", method = "Wald")
+```
+```{r}
+imm_log_interaction_mid_REML <- update(imm_log_interaction_mid, REML = TRUE)
+summary(imm_log_interaction_mid_REML)
+imm_linear_interaction_mid_REML <- update(imm_linear_interaction_mid, REML = TRUE)
+summary(imm_linear_interaction_mid_REML)
+```
+```{r effect size imm}
+# effect size
+r.squaredGLMM(imm_linear_interaction_mid_REML)
+r.squaredGLMM(imm_log_interaction_mid_REML)
+AIC(imm_linear_interaction_mid, imm_log_interaction_mid)
+```
+```{r draw linear imm}
+pred_lin <- ggpredict(imm_linear_interaction_mid_REML, terms = c("speed [all]", "lightness"))
+set.seed(123)
+p_imm_linear_sample<-ggplot(pred_lin, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Speed (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = df_immobile %>% dplyr::sample_frac(0.05),
+    aes(x = speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = file.path(output_folder, "imm_linear_interaction_model_dFF_vs_speed.tiff"),
+  plot = p_imm_linear_sample,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+```{r draw log interaction imm}
+pred_log_interaction_final <- ggpredict(imm_log_interaction_mid_REML, terms = c("log_speed [all]", "lightness"))
+set.seed(123)
+p_imm_log_interaction <- ggplot(pred_log_interaction_final, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, color = NA) +
+  labs(
+    x = "Log(speed) (cm/s)",
+    y = expression(Fluorescence  ~ (z-score)),
+    color = "Lightness",
+    fill  = "Lightness"
+  ) +
+  geom_point(
+    data = df_immobile %>% dplyr::sample_frac(0.2),
+    aes(x = log_speed, y = dFF_z, color = lightness),
+    size = 0.2,
+    alpha = 0.2,
+    inherit.aes = FALSE
+  ) +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "imm_log_interaction_model_dFF_vs_log_speed.tiff"),
+  plot = p_imm_log_interaction,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+```
+```{r  imm LOSO for log vs linear}
+dat_cv <- df_immobile %>%
+  mutate(
+    lightness    = droplevels(lightness),
+    animal       = droplevels(animal),
+    session      = droplevels(session)
+  ) %>%
+  filter(
+    !is.na(dFF_z),
+    !is.na(lightness),
+    !is.na(animal),
+    !is.na(session)
+  )
+
+sessions <- levels(dat_cv$session)
+
+score_fold <- function(model, test_df, y = "dFF_z", pred_fixed_only = TRUE) {
+  # pred_fixed_only=TRUE：only use fixed effects for prediction
+  # pred_fixed_only=FALSE：use conditional prediction (including random effects of animal; new levels of animal:session will be set to 0)
+  pred <- predict(
+    model,
+    newdata = test_df,
+    re.form = if (pred_fixed_only) NA else NULL,
+    allow.new.levels = TRUE
+  )
+  err  <- test_df[[y]] - pred
+  rmse <- sqrt(mean(err^2, na.rm = TRUE))
+  mae  <- mean(abs(err), na.rm = TRUE)
+
+  # Gaussian log score (the bigger the better)
+  sig <- sigma(model)
+  logscore <- mean(dnorm(test_df[[y]], mean = pred, sd = sig, log = TRUE), na.rm = TRUE)
+
+  list(rmse = rmse, mae = mae, logscore = logscore)
+}
+
+# 1) LOSO：leave-one-session-out cross-validation
+results_loso <- lapply(sessions, function(s_out) {
+  train_df <- dat_cv %>% filter(session != s_out)
+  test_df  <- dat_cv %>% filter(session == s_out)
+
+  # because we want to compare linear vs. log models fixed effects, let REML=FALSE
+  m_lin <- lmer(
+    dFF_z ~ speed * lightness + (1 | animal:session) + (speed || animal),
+    data = train_df, REML = FALSE
+  )
+
+  m_log <- lmer(
+    dFF_z ~ log_speed * lightness + (1 | animal:session) + (log_speed || animal),
+    data = train_df, REML = FALSE
+  )
+
+  sc_lin <- score_fold(m_lin, test_df, pred_fixed_only = TRUE)
+  sc_log <- score_fold(m_log, test_df, pred_fixed_only = TRUE)
+
+  tibble(
+    session = s_out,
+    n_test  = nrow(test_df),
+
+    rmse_lin = sc_lin$rmse,
+    rmse_log = sc_log$rmse,
+    d_rmse   = sc_log$rmse - sc_lin$rmse,     # <0 favors log
+
+    mae_lin  = sc_lin$mae,
+    mae_log  = sc_log$mae,
+    d_mae    = sc_log$mae - sc_lin$mae,       # <0 favors log
+
+    lscore_lin = sc_lin$logscore,
+    lscore_log = sc_log$logscore,
+    d_lscore   = sc_log$logscore - sc_lin$logscore  # >0 favors log
+  )
+}) %>% bind_rows()
+
+# 2) summary of LOSO results
+summary_loso <- results_loso %>%
+  summarise(
+    n_sessions = n(),
+    mean_d_rmse = mean(d_rmse),
+    sd_d_rmse   = sd(d_rmse),
+    mean_d_mae  = mean(d_mae),
+    sd_d_mae    = sd(d_mae),
+    mean_d_lscore = mean(d_lscore),
+    sd_d_lscore   = sd(d_lscore)
+  )
+
+print(summary_loso)
+
+# 3) t.test is actually wrong, but for reference
+# d_rmse < 0 --> log and d_lscore > 0 --> log
+t_rmse   <- t.test(results_loso$d_rmse, mu = 0)
+t_mae    <- t.test(results_loso$d_mae,  mu = 0)
+t_lscore <- t.test(results_loso$d_lscore, mu = 0)
+
+t_rmse
+t_mae
+t_lscore
+
+# 4) bootstrap 95% CI for mean differences
+set.seed(1)
+B <- 5000
+boot_mean_drmse <- replicate(B, mean(sample(results_loso$d_rmse, replace = TRUE)))
+boot_ci_drmse <- quantile(boot_mean_drmse, c(0.025, 0.975))
+
+boot_mean_dlscore <- replicate(B, mean(sample(results_loso$d_lscore, replace = TRUE)))
+boot_ci_dlscore <- quantile(boot_mean_dlscore, c(0.025, 0.975))
+
+boot_ci_drmse
+boot_ci_dlscore
+```
+## 6. Methods for examining regression assumptions
+
+```{r}
+binned_data$fitted_values <- fitted(model_log_interaction_mid_REML)
+binned_data$residuals <- residuals(model_log_interaction_mid_REML)
+
+# Scatter plot of residuals vs. fitted values
+p_residuals_vs_fitted <- ggplot(binned_data, aes(x = fitted_values, y = residuals, color = lightness)) +
+  geom_point(size=0.2, alpha = 0.2) +
+  labs(x = "Fitted Fluorescence (z-score)", y = "Residuals") +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "residuals_vs_fitted.tiff"),
+  plot = p_residuals_vs_fitted,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Scatter plot of residuals vs. log_speed
+p_residuals_vs_log_speed <- ggplot(binned_data, aes(x = log_speed, y = residuals, color = lightness)) +
+  geom_point(size=0.2, alpha = 0.2) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Log(speed) (cm/s)", y = "Residuals") +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "residuals_vs_log_speed.tiff"),
+  plot = p_residuals_vs_log_speed,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Scatter plot of observed vs. fitted values
+p_observed_vs_fitted <- ggplot(binned_data, aes(x = fitted_values, y = dFF_z, color = lightness)) +
+  geom_point(size=0.2, alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(x = "Fitted Fluorescence (z-score)", 
+       y = "Observed Fluorescence (z-score)") +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "observed_vs_fitted.tiff"),
+  plot = p_observed_vs_fitted,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+# Q-Q plot of residuals
+p_qq_plot <- ggplot(binned_data, aes(sample = residuals)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+ggsave(
+  filename = file.path(output_folder, "qq_plot_residuals.tiff"),
+  plot = p_qq_plot,
+  device = "tiff",
+  width = 180,
+  height = 150,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+```
+
+
+```{r autocorrelation}
+# compute lag-1 autocorrelation per session, then summarize
+acf_by_session <- binned_data %>%
+  group_by(animal, session) %>%
+  arrange(time_bin, .by_group = TRUE) %>%
+  summarise(
+    acf1 = cor(residuals[-1], residuals[-n()], use = "complete.obs"),
+    .groups = "drop"
+  )
+
+summary(acf_by_session$acf1)
+```
+It is highly autocorrelated, which is not surprising but not ideal for LMM. But given the complexity of the data structure, it is hard to model the autocorrelation properly, and other researchers have also used LMM for similar data.

@@ -1,0 +1,15 @@
+# Ignore everything by default
+*
+
+# But keep these folders (and everything inside)
+!code/
+!code/**
+
+!data-raw/
+!data-raw/**
+
+# Keep git-related files
+!.gitignore
+!README.md
+!LICENSE
+!CITATION.cff
