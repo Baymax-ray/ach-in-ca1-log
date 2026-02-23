@@ -11,5 +11,5 @@
 # Keep git-related files
 !.gitignore
 !README.md
-!LICENSE
+!LICENSE.txt
 !CITATION.cff
